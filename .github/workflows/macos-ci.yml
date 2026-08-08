@@ -16,8 +16,9 @@ jobs:
         include:
           - os: macos-14   # Apple Silicon (arm64)
             arch: arm64
-          - os: macos-13   # Intel (x86_64)
-            arch: x86_64
+          # Intel (macos-13) is omitted: GitHub's free x86_64 macOS runners are
+          # effectively unavailable and the job sits queued indefinitely. Add
+          # `- os: macos-13 / arch: x86_64` back if an Intel build is needed.
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install dependencies

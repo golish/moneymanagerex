@@ -1,0 +1,48 @@
+name: macOS CI Build
+
+# Fork-only workflow: upstream has no macOS CI, so this exists purely to
+# produce a .dmg for local testing. Not part of the upstream pull request.
+
+on:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14   # Apple Silicon (arm64)
+            arch: arm64
+          - os: macos-13   # Intel (x86_64)
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install wxwidgets gettext
+          echo "$(brew --prefix gettext)/bin" >> $GITHUB_PATH
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build MoneyManagerEx
+        id: mmex-build
+        run: |
+          wx-config --version
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -j$(sysctl -n hw.ncpu) --target package
+          ls -la *.dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmex-macos-${{ matrix.arch }}
+          path: build/*.dmg
+          if-no-files-found: error

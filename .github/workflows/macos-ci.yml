@@ -84,28 +84,28 @@ jobs:
       - name: Verify the bundle is self-contained
         run: |
           cd build
-          # Mount the produced .dmg and inspect the real app the user will run,
-          # so this checks the shipped artifact rather than the build tree.
-          dmg=$(ls *.dmg | head -n 1)
-          hdiutil attach "$dmg" -mountpoint /tmp/mmexdmg -nobrowse -readonly
-          app=$(ls -d /tmp/mmexdmg/*.app | head -n 1)
-          # Bundle name and executable name differ (MMEX.app vs mmex), so locate
-          # the executable rather than deriving it from the bundle name.
+          # The .dmg carries a licence agreement, which makes `hdiutil attach`
+          # interactive, so inspect the .app that CPack packages instead - it is
+          # the same binary that ends up in the disk image.
+          app=$(find . -maxdepth 3 -name "*.app" -type d | head -n 1)
           bin=$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 | head -n 1)
           echo "app: $app"
           echo "bin: $bin"
           echo "== architectures =="
-          lipo -info "$bin" || true
+          lipo -info "$bin"
           echo "== linked libraries =="
           otool -L "$bin"
-          # Fail if anything outside the OS-provided paths is referenced.
+          # Fail if anything outside the OS-provided paths is referenced: those
+          # are exactly the libraries that will be missing on someone else's Mac.
           if otool -L "$bin" | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
             echo "::error::Bundle links non-system libraries; it will not run on a clean Mac."
-            hdiutil detach /tmp/mmexdmg
             exit 1
           fi
           echo "OK: only system libraries are referenced."
-          hdiutil detach /tmp/mmexdmg
+          # Both slices must be present or the universal claim is false.
+          lipo -info "$bin" | grep -q "arm64" || { echo "::error::missing arm64 slice"; exit 1; }
+          lipo -info "$bin" | grep -q "x86_64" || { echo "::error::missing x86_64 slice"; exit 1; }
+          echo "OK: universal binary contains both arm64 and x86_64."
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4

@@ -1,31 +1,64 @@
 name: macOS CI Build
 
 # Fork-only workflow: upstream has no macOS CI, so this exists purely to
-# produce a .dmg for local testing. Not part of the upstream pull request.
+# produce a self-contained .dmg for local testing. Not part of the upstream
+# pull request.
+#
+# This mirrors the official recipe in BUILD.md rather than using Homebrew's
+# wxWidgets: wx is built from source with --disable-shared so the resulting
+# .app statically links wx and runs on a machine that has no Homebrew at all.
+# A Homebrew (shared) wx build produces an .app that crashes on launch with
+# missing /opt/homebrew/**/*.dylib.
 
 on:
   push:
     branches:
       - "master"
+  workflow_dispatch:
+
+env:
+  WX_VERSION: 3.3.3
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14   # Apple Silicon (arm64)
-            arch: arm64
-          # Intel (macos-13) is omitted: GitHub's free x86_64 macOS runners are
-          # effectively unavailable and the job sits queued indefinitely. Add
-          # `- os: macos-13 / arch: x86_64` back if an Intel build is needed.
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
     steps:
       - name: Install dependencies
         run: |
           brew update
-          brew install wxwidgets gettext
-          echo "$(brew --prefix gettext)/bin" >> $GITHUB_PATH
+          brew install ccache gettext cmake
+          brew link --force gettext
+
+      - name: Restore wxWidgets cache
+        id: restore-wx
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/wx/wxWidgets-${{ env.WX_VERSION }}/build-cocoa
+          key: wx-${{ env.WX_VERSION }}-macos-14-universal-static-v1
+
+      - name: Build wxWidgets (static, universal)
+        if: steps.restore-wx.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/wx && cd ~/wx
+          curl -fsSL -O https://github.com/wxWidgets/wxWidgets/releases/download/v${WX_VERSION}/wxWidgets-${WX_VERSION}.tar.bz2
+          tar xjf wxWidgets-${WX_VERSION}.tar.bz2
+          cd wxWidgets-${WX_VERSION}
+          mkdir -p build-cocoa && cd build-cocoa
+          ../configure \
+            --enable-std_containers \
+            --disable-shared \
+            --with-cxx=17 \
+            --with-macosx-version-min=11.0 \
+            --without-libtiff \
+            --enable-universal-binary=arm64,x86_64
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Save wxWidgets cache
+        if: steps.restore-wx.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/wx/wxWidgets-${{ env.WX_VERSION }}/build-cocoa
+          key: wx-${{ env.WX_VERSION }}-macos-14-universal-static-v1
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,17 +66,45 @@ jobs:
           submodules: recursive
 
       - name: Build MoneyManagerEx
-        id: mmex-build
         run: |
-          wx-config --version
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake -DCMAKE_CXX_FLAGS="-w" \
+            -DwxWidgets_CONFIG_EXECUTABLE=$HOME/wx/wxWidgets-${WX_VERSION}/build-cocoa/wx-config \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 ..
           cmake --build . -j$(sysctl -n hw.ncpu) --target package
           ls -la *.dmg
+
+      - name: Verify the bundle is self-contained
+        run: |
+          cd build
+          # Mount the produced .dmg and inspect the real app the user will run,
+          # so this checks the shipped artifact rather than the build tree.
+          dmg=$(ls *.dmg | head -n 1)
+          hdiutil attach "$dmg" -mountpoint /tmp/mmexdmg -nobrowse -readonly
+          app=$(ls -d /tmp/mmexdmg/*.app | head -n 1)
+          # Bundle name and executable name differ (MMEX.app vs mmex), so locate
+          # the executable rather than deriving it from the bundle name.
+          bin=$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 | head -n 1)
+          echo "app: $app"
+          echo "bin: $bin"
+          echo "== architectures =="
+          lipo -info "$bin" || true
+          echo "== linked libraries =="
+          otool -L "$bin"
+          # Fail if anything outside the OS-provided paths is referenced.
+          if otool -L "$bin" | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+            echo "::error::Bundle links non-system libraries; it will not run on a clean Mac."
+            hdiutil detach /tmp/mmexdmg
+            exit 1
+          fi
+          echo "OK: only system libraries are referenced."
+          hdiutil detach /tmp/mmexdmg
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: mmex-macos-${{ matrix.arch }}
+          name: mmex-macos-universal
           path: build/*.dmg
           if-no-files-found: error

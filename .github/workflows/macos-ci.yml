@@ -97,7 +97,9 @@ jobs:
           otool -L "$bin"
           # Fail if anything outside the OS-provided paths is referenced: those
           # are exactly the libraries that will be missing on someone else's Mac.
-          if otool -L "$bin" | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+          # otool prints a header line per architecture, so keep only the
+          # indented dependency lines before filtering.
+          if otool -L "$bin" | grep -E '^[[:space:]]' | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
             echo "::error::Bundle links non-system libraries; it will not run on a clean Mac."
             exit 1
           fi

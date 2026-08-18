@@ -1,0 +1,227 @@
+name: Windows CI Build
+
+# Fork-only workflow: upstream builds Windows on AppVeyor, which cannot build
+# this branch. AppVeyor regenerates src/table/* from the `database` submodule
+# during before_build, so until the v22 schema is merged upstream the
+# regeneration replaces the new tables with v21 and compilation fails. GitHub
+# Actions compiles the sources committed here, exactly as the Ubuntu and macOS
+# workflows already do, so it can build the branch today.
+#
+# Not part of the upstream pull request.
+#
+# wxWidgets is built from source rather than taken from the published binaries
+# because those are compiled without the Edge WebView backend. MMEX renders its
+# reports -- including the plan charts -- through wxWebView, and the fallback IE
+# backend cannot run modern JavaScript, so charts would silently fail to draw.
+# wx is linked statically so the portable .zip has no wx DLLs to lose.
+
+on:
+  push:
+    branches:
+      - "master"
+  workflow_dispatch:
+
+env:
+  WX_VERSION: 3.3.3
+  CURL_VERSION: 8_5_0
+  WXWIN: C:\wx\wxWidgets
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Restore wxWidgets cache
+        id: restore-wx
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\wx
+          key: wx-${{ env.WX_VERSION }}-windows-2022-x64-static-edge-v1
+
+      - name: Build wxWidgets (static, Edge WebView)
+        if: steps.restore-wx.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          mkdir C:\wx || exit /b 0
+          cd C:\wx
+          curl -fsSL -o wx.zip https://github.com/wxWidgets/wxWidgets/releases/download/v%WX_VERSION%/wxWidgets-%WX_VERSION%.zip || exit /b 1
+          7z x -y -owxWidgets wx.zip > nul || exit /b 1
+          cd wxWidgets
+          cmake . -G "Visual Studio 17 2022" -A x64 ^
+            -DwxBUILD_SHARED=OFF ^
+            -DwxUSE_WEBVIEW_EDGE=ON ^
+            -DwxBUILD_VENDOR=mmex || exit /b 1
+          cmake --build . --config Release --parallel || exit /b 1
+          del /q wx.zip 2> nul
+          exit /b 0
+
+      - name: Save wxWidgets cache
+        if: steps.restore-wx.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\wx
+          key: wx-${{ env.WX_VERSION }}-windows-2022-x64-static-edge-v1
+
+      - name: Restore libcurl cache
+        id: restore-curl
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\curl-install
+          key: curl-${{ env.CURL_VERSION }}-windows-2022-x64-static-v1
+
+      - name: Build libcurl (static, Schannel)
+        if: steps.restore-curl.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          git clone -q --depth=1 -b curl-%CURL_VERSION% --single-branch https://github.com/curl/curl.git C:\curl-src || exit /b 1
+          mkdir C:\curl-src\build
+          cd C:\curl-src\build
+          cmake -G "Visual Studio 17 2022" -A x64 ^
+            -DBUILD_CURL_EXE=OFF ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DHTTP_ONLY=ON ^
+            -DENABLE_MANUAL=OFF ^
+            -DCURL_USE_SCHANNEL=ON ^
+            -DCURL_USE_LIBPSL=OFF ^
+            -DBUILD_TESTING=OFF ^
+            -DCMAKE_INSTALL_PREFIX=C:\curl-install .. || exit /b 1
+          cmake --build . --target install --config Release --parallel || exit /b 1
+
+      - name: Save libcurl cache
+        if: steps.restore-curl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\curl-install
+          key: curl-${{ env.CURL_VERSION }}-windows-2022-x64-static-v1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install gettext and NSIS
+        shell: pwsh
+        run: |
+          # CMake needs msgmerge/msgfmt for po/, and CPack needs makensis for the
+          # installer. The runner has neither on PATH by default. GnuWin32's
+          # gettext 0.14.4 is not usable -- msgfmt crashes on startup for want of
+          # its libintl/libiconv DLLs -- so take the modern static build.
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/mlocati/gettext-iconv-windows/releases/download/v1.0-v1.19/gettext1.0-iconv1.19-static-64.zip"
+          Invoke-WebRequest $url -OutFile gettext.zip
+          Expand-Archive gettext.zip -DestinationPath C:\gettext -Force
+          "C:\gettext\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & C:\gettext\bin\msgfmt.exe --version | Select-Object -First 1
+
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build MoneyManagerEx
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake -G "Visual Studio 17 2022" -A x64 ^
+            -DCMAKE_PREFIX_PATH=C:\curl-install ^
+            -DwxWidgets_ROOT_DIR=%WXWIN% ^
+            -DwxWidgets_LIB_DIR=%WXWIN%\lib\vc_x64_lib ^
+            -DwxWidgets_USE_REL_AND_DBG=0 -Wno-dev .. || exit /b 1
+          cmake --build . --target package --config Release --parallel ^
+            -- /verbosity:minimal /nologo || exit /b 1
+          dir *.exe *.zip
+
+      - name: Make the portable build actually portable
+        shell: pwsh
+        run: |
+          # MMEX treats an mmexini.db3 beside the executable as the signal to
+          # keep its settings in that folder (src/util/mmPath.cpp). Without it a
+          # "portable" build silently falls back to the user profile, picks up
+          # an existing MMEX install's settings, and can reopen -- and upgrade --
+          # whatever database that install last used. CPack's ZIP does not add
+          # the file, so add it here, as upstream's AppVeyor recipe does.
+          cd build
+          $zip = Get-ChildItem *.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath _portable -Force
+          $bin = (Get-ChildItem _portable -Recurse -Filter mmex.exe | Select-Object -First 1).DirectoryName
+          New-Item -ItemType File -Force -Path (Join-Path $bin "mmexini.db3") | Out-Null
+          $out = $zip.FullName -replace '\.zip$', '-portable.zip'
+          Remove-Item $zip.FullName -Force
+          Compress-Archive -Path (Get-ChildItem _portable | ForEach-Object FullName) -DestinationPath $out -CompressionLevel Optimal
+          Write-Host "portable zip: $out"
+
+      - name: Verify the build is self-contained
+        shell: pwsh
+        run: |
+          # The portable .zip is what a tester unpacks and runs, so check that
+          # rather than the installer: anything it needs and does not carry is a
+          # crash on someone else's machine.
+          $zip = Get-ChildItem build\*.zip | Select-Object -First 1
+          if (-not $zip) { Write-Error "no portable zip produced"; exit 1 }
+          Expand-Archive $zip.FullName -DestinationPath build\_verify -Force
+          $exe = Get-ChildItem build\_verify -Recurse -Filter mmex.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "mmex.exe not found in the portable zip"; exit 1 }
+          Write-Host "exe: $($exe.FullName)  $([math]::Round($exe.Length/1MB,1)) MB"
+
+          # wx linked statically means no wx*.dll should appear beside the exe.
+          $wxdll = Get-ChildItem $exe.DirectoryName -Filter "wx*.dll" -ErrorAction SilentlyContinue
+          if ($wxdll) {
+            Write-Error "wxWidgets DLLs present, so wx was not linked statically: $($wxdll.Name -join ', ')"
+            exit 1
+          }
+          Write-Host "OK: no wxWidgets DLLs, wx is linked statically."
+
+          # The Edge backend loads this at runtime; without it reports render
+          # blank on a machine that has no other copy.
+          if (-not (Test-Path (Join-Path $exe.DirectoryName "WebView2Loader.dll"))) {
+            Write-Error "WebView2Loader.dll missing; wxWebView Edge will fail at runtime."
+            exit 1
+          }
+          Write-Host "OK: WebView2Loader.dll is bundled."
+
+          # Without this the build is not portable and can reach a real database.
+          if (-not (Test-Path (Join-Path $exe.DirectoryName "mmexini.db3"))) {
+            Write-Error "mmexini.db3 missing; the build would use the user profile, not portable mode."
+            exit 1
+          }
+          Write-Host "OK: mmexini.db3 present, portable mode will be used."
+
+          # Anything imported that is neither an OS DLL nor shipped alongside is
+          # a failure to launch on a machine without the build tools installed.
+          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC",`
+                                   "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC" `
+                     -Directory -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Descending | Select-Object -First 1
+          if ($dumpbin) {
+            $tool = Join-Path $dumpbin.FullName "bin\Hostx64\x64\dumpbin.exe"
+            if (Test-Path $tool) {
+              $deps = & $tool /dependents $exe.FullName |
+                      Select-String -Pattern '^\s+\S+\.dll' |
+                      ForEach-Object { $_.ToString().Trim() }
+              Write-Host "imports:"; $deps | ForEach-Object { Write-Host "  $_" }
+              $shipped = (Get-ChildItem $exe.DirectoryName -Filter *.dll).Name
+              $missing = $deps | Where-Object {
+                $_ -notmatch '^(api-ms-win-|ext-ms-win-)' -and
+                $shipped -notcontains $_ -and
+                -not (Test-Path (Join-Path $env:WINDIR "System32\$_"))
+              }
+              if ($missing) {
+                Write-Error "unresolved imports: $($missing -join ', ')"
+                exit 1
+              }
+              Write-Host "OK: every import is an OS DLL or ships in the zip."
+            }
+          }
+          Get-ChildItem $exe.DirectoryName | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmex-windows-x64-installer
+          path: build/*.exe
+          if-no-files-found: error
+
+      - name: Upload portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmex-windows-x64-portable
+          path: build/*.zip
+          if-no-files-found: error

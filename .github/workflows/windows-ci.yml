@@ -39,8 +39,14 @@ jobs:
         id: restore-wx
         uses: actions/cache/restore@v4
         with:
-          path: C:\wx
-          key: wx-${{ env.WX_VERSION }}-windows-2022-x64-static-edge-v2
+          # Only what is needed to build against wx, not the whole source tree
+          # with its object files. Caching all of C:\wx meant several GB, and
+          # the restore came back without include/, so FindwxWidgets fell over
+          # with "wx/version.h file not found" while the libraries were present.
+          path: |
+            C:\wx\wxWidgets\include
+            C:\wx\wxWidgets\lib
+          key: wx-${{ env.WX_VERSION }}-windows-2022-x64-static-edge-v3
 
       - name: Build wxWidgets (static, Edge WebView)
         if: steps.restore-wx.outputs.cache-hit != 'true'
@@ -59,9 +65,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build . --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          # Fail here rather than let the next step save an empty cache.
-          if (-not (Test-Path "$env:WXWIN\lib\vc_x64_lib\wxmsw33u_webview.lib")) {
-            Write-Error "wxWidgets did not produce libraries in $env:WXWIN\lib\vc_x64_lib"
+
+      - name: Check the wxWidgets tree is usable
+        shell: pwsh
+        run: |
+          # Runs on both paths, so a cache that restores incomplete fails here
+          # with a clear message rather than inside FindwxWidgets.
+          $ok = $true
+          foreach ($p in @(
+            "$env:WXWIN\include\wx\wx.h",
+            "$env:WXWIN\include\wx\version.h",
+            "$env:WXWIN\lib\vc_x64_lib\mswu\wx\setup.h",
+            "$env:WXWIN\lib\vc_x64_lib\wxmsw33u_webview.lib"
+          )) {
+            if (Test-Path $p) { Write-Host "ok   $p" }
+            else { Write-Host "MISSING $p"; $ok = $false }
+          }
+          if (-not $ok) {
+            Write-Error "wxWidgets tree is incomplete; bump the cache key to rebuild it."
             exit 1
           }
 
@@ -69,8 +90,10 @@ jobs:
         if: steps.restore-wx.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: C:\wx
-          key: wx-${{ env.WX_VERSION }}-windows-2022-x64-static-edge-v2
+          path: |
+            C:\wx\wxWidgets\include
+            C:\wx\wxWidgets\lib
+          key: wx-${{ env.WX_VERSION }}-windows-2022-x64-static-edge-v3
 
       - name: Restore libcurl cache
         id: restore-curl

@@ -159,12 +159,18 @@ jobs:
       - name: Build MoneyManagerEx
         shell: pwsh
         run: |
+          # Every -D value that contains a variable must be quoted. PowerShell
+          # does not expand $env:X after an '=' inside an unquoted argument that
+          # begins with '-', so -DwxWidgets_ROOT_DIR=$env:WXWIN reaches CMake as
+          # the literal text '$env:WXWIN' and the include directory comes out
+          # empty -- which surfaces much later as FindwxWidgets complaining that
+          # wx/version.h is missing, even though the tree is complete.
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Set-Location build
           cmake -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_PREFIX_PATH=C:\curl-install `
-            -DwxWidgets_ROOT_DIR=$env:WXWIN `
+            -DCMAKE_PREFIX_PATH="C:\curl-install" `
+            -DwxWidgets_ROOT_DIR="$env:WXWIN" `
             -DwxWidgets_LIB_DIR="$env:WXWIN\lib\vc_x64_lib" `
             -DwxWidgets_USE_REL_AND_DBG=0 -Wno-dev ..
           if ($LASTEXITCODE -ne 0) { exit 1 }
